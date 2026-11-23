@@ -37,6 +37,11 @@ from server_logging import configure, get_logger, LEVELS
 
 log = get_logger('http')
 
+# Remote mirror for missing assets is disabled unless --allow-remote-assets is given.
+ALLOW_REMOTE_ASSETS = False
+REMOTE_ASSET_SUFFIXES = (".swf", ".png", ".jpg", ".dat", ".cub", ".xml")
+REMOTE_ASSET_MAX_BYTES = 32 * 1024 * 1024
+
 STORE = Store()
 
 
@@ -160,25 +165,30 @@ class Handler(SimpleHTTPRequestHandler):
 
         file_path = WWW / path.lstrip("/")
         if not file_path.exists():
-            # Dynamically fetch & cache any missing asset from netzone mirror
-            if path.startswith("/rez/") or path.endswith((".swf", ".png", ".jpg", ".dat", ".cub", ".xml")):
+            # Optional mirror fetch for missing assets. OFF by default (offline build);
+            # enable explicitly with --allow-remote-assets. TLS is always verified and
+            # the cache target must stay inside www/rez.
+            if ALLOW_REMOTE_ASSETS and path.startswith("/rez/") and path.endswith(REMOTE_ASSET_SUFFIXES):
                 try:
                     import urllib.request
                     import ssl
+                    from urllib.parse import unquote
+                    target = (WWW / unquote(path).lstrip("/")).resolve()
+                    if (WWW / "rez").resolve() not in target.parents:
+                        raise ValueError("path outside www/rez")
                     ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
                     upstream_url = f"https://netzone.id.vn{path}"
                     req = urllib.request.Request(upstream_url, headers={"User-Agent": "Mozilla/5.0 BB-private-mirror"})
                     with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
                         if resp.status == 200:
-                            data = resp.read()
-                            file_path.parent.mkdir(parents=True, exist_ok=True)
-                            file_path.write_bytes(data)
+                            data = resp.read(REMOTE_ASSET_MAX_BYTES + 1)
+                            if len(data) > REMOTE_ASSET_MAX_BYTES:
+                                raise ValueError("remote asset too large")
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(data)
                             log.info(f"[http] Proxy-cached {path} ({len(data)} bytes) from netzone")
                             self.send_response(200)
-                            ctype = self.guess_type(str(file_path))
-                            self.send_header("Content-Type", ctype)
+                            self.send_header("Content-Type", self.guess_type(str(target)))
                             self.send_header("Content-Length", str(len(data)))
                             self.end_headers()
                             self.wfile.write(data)
@@ -278,6 +288,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18083)
     parser.add_argument("--https-port", type=int, default=18443)
     parser.add_argument("--bind", default="0.0.0.0")
+    parser.add_argument("--allow-remote-assets", action="store_true",
+                        help="Fetch missing assets from the netzone mirror (TLS verified, www/rez only). Off by default.")
     parser.add_argument('--enable-admin-buff', action='store_true',
                         help='Explicitly enable loopback-only gift-mail admin; never grants on startup')
     parser.add_argument('--admin-key-file', type=Path,
@@ -285,6 +297,8 @@ def main() -> None:
     parser.add_argument("--log-level", choices=LEVELS, default="WARNING", type=str.upper,
                         help="WARNING by default; DEBUG also records raw TCP packets")
     args = parser.parse_args()
+    global ALLOW_REMOTE_ASSETS
+    ALLOW_REMOTE_ASSETS = args.allow_remote_assets
     if args.admin_key_file and not args.enable_admin_buff:
         parser.error('--admin-key-file requires --enable-admin-buff')
     configure(args.log_level)
